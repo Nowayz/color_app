@@ -1,0 +1,856 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebGPU HDR & Bit Depth Test</title>
+    <style>
+      :root {
+        --bg: #000;
+        --fg: #e7e7e7;
+        --panel: rgba(8, 8, 8, 0.7);
+        --panel-border: rgba(255,255,255,0.10);
+        --input-bg: #111;
+        --input-fg: #ddd;
+        --input-border: #333;
+        --btn: #1f6feb;
+        --btn-border: #2a7df0;
+        --chip-bg: rgba(24, 24, 24, 0.85);
+        --chip-border: rgba(255,255,255,0.12);
+        --muted-border: #333;
+        --shadow: 0 1px 3px rgba(0,0,0,0.6);
+        /* shared corner radius + overlap fudge between panels */
+        --ui-radius: 8px;
+        --sqrt2: 1.41421356237;
+      }
+
+      /* Base */
+      html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--fg); font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, Helvetica, "Apple Color Emoji", "Segoe UI Emoji"; }
+      #app { position: fixed; inset: 0; overflow: hidden; }
+      canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; background: #000; touch-action: none; }
+
+      /* Layout utilities (generic, reusable) */
+      .stack { display: flex; flex-direction: row; gap: 4px; align-items: flex-start; margin-top: -6px; }
+      .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+      .group { display: flex; gap: 6px; align-items: center; }
+      .divider { width: 1px; height: 24px; background: var(--muted-border); margin: 0 4px; }
+
+      /* Panels */
+      .toolbar { position: fixed; top: 10px; left: 10px; display: flex; flex-direction: column; align-items: flex-start; gap: 0; z-index: 10;  /*backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);  */}
+      .ui { background: var(--panel); padding: 10px 12px;}
+      .ui label { font-size: 12px; opacity: 0.85; }
+
+      /* Inputs */
+      .ui select, .ui input[type="range"] { font-size: 12px; background: var(--input-bg); color: var(--input-fg); border: 1px solid var(--input-border); border-radius: 4px; padding: 4px 6px; }
+
+      /* Buttons */
+      .btn { font-size: 12px; color: #fff; background: var(--btn); border: 1px solid var(--btn-border); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+
+      /* Chips */
+      .chip { font-size: 12px; padding: 4px 8px; border-radius: 999px; background: var(--chip-bg); border: 1px solid var(--chip-border); box-shadow: var(--shadow); display: inline-flex; align-items: center; }
+      .chip.sm { font-size: 11px; padding: 3px 8px; }
+      .ok { color: #56d364; }
+      .warn { color: #ffcc66; }
+      .bad { color: #ff7b72; }
+
+      /* Status panel composes only utilities + .chip */
+      .status-panel { padding-top: 4px; padding-bottom: 10px; align-self: flex-start; display: block; }
+      .status-panel { border-bottom-left-radius: var(--ui-radius); border-bottom-right-radius: var(--ui-radius); }
+      .status-panel::before {
+        clip-path: path("M 0 0 V 8 A 8 8 0 0 1 8 0 Z");
+        content: "";
+        position: relative;
+        display: block;
+        width: var(--ui-radius);
+        height: var(--ui-radius);
+        left: calc(100% + var(--ui-radius) * var(--sqrt2));
+        top:  calc(-0.5 * var(--ui-radius));
+        background: var(--panel);
+      }
+
+      /* Controls div rounding: all corners except bottom-left */
+      #controls { border-radius: var(--ui-radius) var(--ui-radius) var(--ui-radius) 0; }
+
+      /* Labels overlay */
+      #labels { position: fixed; inset: 0; pointer-events: none; color: #dedede; font-size: 12px; line-height: 1.2; z-index: 6; }
+      #labels .tag { display: inline-flex; align-items: center; justify-content: center; padding: 4px 8px; border-radius: 999px; background: var(--panel); border: 1px solid rgba(255,255,255,0.08); text-shadow: var(--shadow); backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px); white-space: nowrap; }
+
+      /* Generic overlay layout primitives */
+      .overlay { position: absolute; }
+      .overlay.hspread { top: 120px; left: 8%; right: 8%; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+      .overlay.vsplit { top: 120px; bottom: 24px; left: 50%; transform: translateX(-50%); width: min(60%, 520px); display: flex; flex-direction: column; justify-content: space-between; align-items: center; gap: 12px; }
+      .overlay.steps { bottom: 7%; left: 6%; right: 6%; display: flex; justify-content: space-between; align-items: flex-end; gap: 8px; }
+      .overlay.columns { top: 12%; left: 20%; right: 12%; display: flex; justify-content: space-between; gap: 16px; }
+      .overlay.rows { top: 22%; bottom: 18%; left: 6%; display: flex; flex-direction: column; justify-content: space-between; gap: 16px; }
+
+
+
+
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="gfx"></canvas>
+      <div id="labels"></div>
+
+      <div class="toolbar">
+        <div class="ui" id="controls">
+          <div class="row">
+            <div class="group">
+              <label for="pattern">Pattern</label>
+              <select id="pattern">
+                <option value="0">Gradient (0-1 / HDR)</option>
+                <option value="1">HDR Color Bars</option>
+                <option value="2">HDR Highlight Steps</option>
+                <option value="3">P3 vs sRGB Stripes</option>
+                <option value="4">Interpolation: ICtCp vs OkLab vs CIELAB</option>
+              </select>
+            </div>
+            <div class="divider"></div>
+            <div class="group">
+              <label for="overbright">Overbright</label>
+              <input id="overbright" type="range" min="1" max="8" step="0.1" value="4" />
+            </div>
+            <div class="group">
+              <label for="colorspace">Color Space</label>
+              <select id="colorspace">
+                <option value="srgb">sRGB</option>
+                <option value="display-p3" selected>display-p3</option>
+              </select>
+            </div>
+            <div class="divider"></div>
+            <div class="group">
+              <button id="fullscreen" class="btn">Fullscreen</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="ui status-panel">
+          <div class="stack">
+            <div class="row">
+              <span class="chip sm" id="swapchain-chip">Pending</span>
+            </div>
+            <div class="row">
+              <span class="chip sm" id="hdr-chip">Unknown</span>
+            </div>
+            <div class="row">
+              <span class="chip sm" id="bitdepth-chip">Unknown</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // Utility: small DOM helpers
+      const $ = (sel) => document.querySelector(sel);
+      const canvas = $('#gfx');
+      const labelsOverlay = $('#labels');
+      const patternSel = $('#pattern');
+      const overbrightSlider = $('#overbright');
+      const colorspaceSel = $('#colorspace');
+      const fullscreenBtn = $('#fullscreen');
+      const swapchainChip = $('#swapchain-chip');
+      const hdrChip = $('#hdr-chip');
+      const bitDepthChip = $('#bitdepth-chip');
+      const controlsEl = $('#controls');
+      const statusPanelEl = document.querySelector('.status-panel');
+      const dynamicRangeMedia = typeof window.matchMedia === 'function' ? window.matchMedia('(dynamic-range: high)') : null;
+
+      let device, context;
+      let format = 'bgra8unorm';
+      let usingExtended = false; // true if rgba16float swapchain configured
+      let colorSpace = 'display-p3';
+      let pipeline = null;
+      let uniformBuf = null;
+      let presentationSize = [0, 0];
+      let webgpuReady = false;
+      let webgpuFailed = false;
+      let extAttempted = false;
+      const state = { pattern: 0, bits: 0, overbright: 4 };
+
+      const paramsLayout = {
+        // Keep in sync with WGSL Params struct
+        // u32,u32,f32,vec2<f32> (2 f32) + padding to 32 bytes
+        size: 32,
+      };
+
+      function getScreenDepth() {
+        const screen = window.screen;
+        if (!screen) return null;
+        return screen.pixelDepth || screen.colorDepth || null;
+      }
+
+      function updateHDRChip() {
+        let text = 'Unknown';
+        let stateClass = null;
+        if (dynamicRangeMedia) {
+          if (dynamicRangeMedia.matches) {
+            text = 'HDR';
+            stateClass = 'ok';
+          } else {
+            text = 'SDR';
+          }
+        }
+        hdrChip.textContent = text;
+        hdrChip.classList.remove('ok', 'warn', 'bad');
+        if (stateClass) hdrChip.classList.add(stateClass);
+      }
+
+      function updateBitDepthChip() {
+        const depth = getScreenDepth();
+        if (bitDepthChip) {
+          bitDepthChip.textContent = depth ? `${depth} bpp` : 'Unknown';
+        }
+      }
+
+      function updateSwapchainChip() {
+        let text = 'Pending';
+        let stateClass = null;
+        if (webgpuFailed) {
+          text = 'Unavailable';
+          stateClass = 'bad';
+        } else if (webgpuReady) {
+          const fmt = format || '-';
+          const cs = colorSpace || '-';
+          text = `${fmt} / ${cs}`;
+          if (usingExtended) {
+            stateClass = 'ok';
+          } else if (extAttempted) {
+            stateClass = 'warn';
+          }
+        }
+        swapchainChip.textContent = text;
+        swapchainChip.classList.remove('ok', 'warn', 'bad');
+        if (stateClass) swapchainChip.classList.add(stateClass);
+      }
+
+      function updateStatusChips() {
+        updateHDRChip();
+        updateBitDepthChip();
+        updateSwapchainChip();
+      }
+
+      updateStatusChips();
+
+      if (dynamicRangeMedia) {
+        const handleDynamicRangeChange = () => updateStatusChips();
+        dynamicRangeMedia?.addEventListener?.('change', handleDynamicRangeChange) || dynamicRangeMedia?.addListener?.(handleDynamicRangeChange);
+      }
+
+
+
+      function updateLabels() {
+        if (!labelsOverlay) return;
+        let html = '';
+        switch (state.pattern) {
+          case 0: {
+            html = `
+        <div class="overlay hspread">
+          <div><span class="tag">0.0</span></div>
+          <div><span class="tag">Linear ramp</span></div>
+          <div><span class="tag">HDR x${Number(state.overbright).toFixed(2).replace(/\.?0+$/, '')}</span></div>
+        </div>`;
+            break;
+          }
+          case 1: {
+            const maxHighlight = Number(Math.min(state.overbright, 8)).toFixed(2).replace(/\.?0+$/, '');
+            html = `
+        <div class="overlay vsplit">
+          <span class="tag">Upper band: SDR 1.0 reference</span>
+          <span class="tag">Primaries &amp; secondaries</span>
+          <span class="tag">Lower band: highlights to x${maxHighlight}</span>
+        </div>`;
+            break;
+          }
+          case 2: {
+            const steps = [0.25, 0.5, 1, 2, 4, 8].map((v) => Number(v).toFixed(2).replace(/\.?0+$/, ''));
+            html = `
+        <div class="overlay steps">
+          ${steps.map((value) => `<div><span class="tag">x${value}</span></div>`).join('')}
+        </div>`;
+            break;
+          }
+          case 3: {
+            const names = ['Red', 'Green', 'Blue', 'Yellow', 'Magenta'];
+            html = `
+        <div class="overlay hspread">
+          ${names.map((name) => `<div><span class="tag">${name}</span></div>`).join('')}
+        </div>`;
+            break;
+          }
+          case 4: {
+            const colNames = ['Red -> Green (0.25 -> 2.5)', 'Blue -> Yellow (0.35 -> 2.2/2.0)', 'Warm -> Cool (0.6/0.2/0.0 -> 0.1/0.5/2.8)'];
+            const rowNames = ['ICtCp (HDR)', 'OkLab (HDR)', 'CIELAB (HDR)'];
+            html = `
+        <div class="overlay columns">
+          ${colNames.map((name) => `<div><span class="tag">${name}</span></div>`).join('')}
+        </div>
+        <div class="overlay rows">
+          ${rowNames.map((name) => `<div><span class="tag">${name}</span></div>`).join('')}
+        </div>`;
+            break;
+          }
+          default: { html = ''; }
+        }
+        labelsOverlay.innerHTML = html;
+        labelsOverlay.style.display = html ? 'block' : 'none';
+      }
+
+      function resizeCanvas() {
+        const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 4));
+        const container = canvas.parentElement || document.body;
+        const rect = container.getBoundingClientRect();
+        const cssW = Math.max(1, Math.round(rect.width));
+        const cssH = Math.max(1, Math.round(rect.height));
+        const w = Math.max(1, Math.round(cssW * dpr));
+        const h = Math.max(1, Math.round(cssH * dpr));
+        canvas.style.width = cssW + 'px';
+        canvas.style.height = cssH + 'px';
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+          presentationSize = [w, h];
+        }
+      }
+
+      function watchDPR() {
+        const dpr = window.devicePixelRatio || 1;
+        const mq = window.matchMedia && window.matchMedia(`(resolution: ${dpr}dppx)`);
+        if (!mq || !mq.addEventListener) return;
+        const onChange = () => {
+          mq.removeEventListener('change', onChange);
+          onResize();
+          watchDPR();
+        };
+        mq.addEventListener('change', onChange);
+      }
+
+      function observeContainer() {
+        if (!('ResizeObserver' in window)) return;
+        const container = canvas.parentElement || document.body;
+        const ro = new ResizeObserver(() => onResize());
+        ro.observe(container);
+      }
+
+      function makeShaderModule(code) {
+        try { return device.createShaderModule({ code }); } catch (e) { console.error('Shader compile failed', e); throw e; }
+      }
+
+const shaderWGSL = /* wgsl */`
+struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, };
+
+@vertex fn vs_main(@builtin(vertex_index) vi : u32) -> VSOut {
+  var p = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -3.0),
+    vec2<f32>(-1.0,  1.0),
+    vec2<f32>( 3.0,  1.0)
+  );
+  var out: VSOut;
+  out.pos = vec4<f32>(p[vi], 0.0, 1.0);
+  out.uv = (p[vi] * 0.5 + vec2<f32>(0.5, 0.5));
+  return out;
+}
+
+struct Params {
+  pattern: u32,
+  bits: u32,
+  overbright: f32,
+  resolution: vec2<f32>,
+};
+@group(0) @binding(0) var<uniform> U : Params;
+
+fn linearToSRGB(x: f32) -> f32 {
+  if (x <= 0.0031308) { return 12.92 * x; }
+  return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+fn sRGBToLinear(x: f32) -> f32 {
+  if (x <= 0.04045) { return x / 12.92; }
+  return pow((x + 0.055) / 1.055, 2.4);
+}
+fn quantizeSRGB(lin: f32, bits: u32) -> f32 {
+  if (bits == 0u) { return lin; }
+  let steps = f32((1u << bits) - 1u);
+  let s = clamp(linearToSRGB(clamp(lin, 0.0, 1.0)), 0.0, 1.0);
+  let q = round(s * steps) / steps;
+  return sRGBToLinear(q);
+}
+
+fn linearSRGBToXYZ(col: vec3<f32>) -> vec3<f32> {
+  return vec3<f32>(
+    0.4124564 * col.r + 0.3575761 * col.g + 0.1804375 * col.b,
+    0.2126729 * col.r + 0.7151522 * col.g + 0.0721750 * col.b,
+    0.0193339 * col.r + 0.1191920 * col.g + 0.9503041 * col.b
+  );
+}
+fn xyzToLinearSRGB(xyz: vec3<f32>) -> vec3<f32> {
+  return vec3<f32>(
+    3.2404542 * xyz.x - 1.5371385 * xyz.y - 0.4985314 * xyz.z,
+   -0.9692660 * xyz.x + 1.8760108 * xyz.y + 0.0415560 * xyz.z,
+    0.0556434 * xyz.x - 0.2040259 * xyz.y + 1.0572252 * xyz.z
+  );
+}
+
+fn linearRec2020ToXYZ(rgb: vec3<f32>) -> vec3<f32> {
+  return vec3<f32>(
+    0.6369580483 * rgb.x + 0.1446169036 * rgb.y + 0.1688809752 * rgb.z,
+    0.2627002120 * rgb.x + 0.6779980715 * rgb.y + 0.0593017165 * rgb.z,
+    0.0 * rgb.x + 0.0280726930 * rgb.y + 1.0609850577 * rgb.z
+  );
+}
+fn xyzToLinearRec2020(xyz: vec3<f32>) -> vec3<f32> {
+  return vec3<f32>(
+    1.7166511870 * xyz.x - 0.3556707838 * xyz.y - 0.2533662814 * xyz.z,
+   -0.6666843518 * xyz.x + 1.6164812366 * xyz.y + 0.0157685458 * xyz.z,
+    0.0176398574 * xyz.x - 0.0427706133 * xyz.y + 0.9421031212 * xyz.z
+  );
+}
+fn linearSRGBToLinearRec2020(col: vec3<f32>) -> vec3<f32> {
+  return xyzToLinearRec2020(linearSRGBToXYZ(col));
+}
+fn linearRec2020ToLinearSRGB(col: vec3<f32>) -> vec3<f32> {
+  return xyzToLinearSRGB(linearRec2020ToXYZ(col));
+}
+
+fn linearSRGBToOkLab(col: vec3<f32>) -> vec3<f32> {
+  let l = 0.4122214708 * col.r + 0.5363325363 * col.g + 0.0514459929 * col.b;
+  let m = 0.2119034982 * col.r + 0.6806995451 * col.g + 0.1073969566 * col.b;
+  let s = 0.0883024619 * col.r + 0.2817188376 * col.g + 0.6299787005 * col.b;
+  let l_ = pow(max(l, 0.0), 1.0 / 3.0);
+  let m_ = pow(max(m, 0.0), 1.0 / 3.0);
+  let s_ = pow(max(s, 0.0), 1.0 / 3.0);
+  return vec3<f32>(
+    0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+    1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+    0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
+  );
+}
+
+fn oklabToLinearSRGB(lab: vec3<f32>) -> vec3<f32> {
+  let l_ = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
+  let m_ = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
+  let s_ = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
+  let l = l_ * l_ * l_;
+  let m = m_ * m_ * m_;
+  let s = s_ * s_ * s_;
+  let col = vec3<f32>(
+    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+   -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+   -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
+  );
+  return clamp(col, vec3<f32>(0.0), vec3<f32>(U.overbright));
+}
+
+fn labPivot(t: f32) -> f32 { let d = 6.0 / 29.0; let d3 = d * d * d; if (t > d3) { return pow(max(t, 0.0), 1.0 / 3.0); } return (t / (3.0 * d * d)) + (4.0 / 29.0); }
+fn labPivotInv(t: f32) -> f32 { let d = 6.0 / 29.0; if (t > d) { return t * t * t; } return 3.0 * d * d * (t - (4.0 / 29.0)); }
+
+fn linearSRGBToLab(col: vec3<f32>) -> vec3<f32> {
+  let xyz = linearSRGBToXYZ(col);
+  let xr = xyz.x / 0.95047; let yr = xyz.y; let zr = xyz.z / 1.08883;
+  let fx = labPivot(xr); let fy = labPivot(yr); let fz = labPivot(zr);
+  return vec3<f32>(116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz));
+}
+fn labToLinearSRGB(lab: vec3<f32>) -> vec3<f32> {
+  let fy = (lab.x + 16.0) / 116.0;
+  let fx = fy + lab.y / 500.0;
+  let fz = fy - lab.z / 200.0;
+  let xr = labPivotInv(fx); let yr = labPivotInv(fy); let zr = labPivotInv(fz);
+  let xyz = vec3<f32>(xr * 0.95047, yr, zr * 1.08883);
+  return clamp(xyzToLinearSRGB(xyz), vec3<f32>(0.0), vec3<f32>(U.overbright));
+}
+
+const HDR_WHITE_NITS: f32 = 203.0;
+const PQ_M1: f32 = 2610.0 / 16384.0;
+const PQ_M2: f32 = 2523.0 / 32.0;
+const PQ_C1: f32 = 3424.0 / 4096.0;
+const PQ_C2: f32 = 2413.0 / 128.0;
+const PQ_C3: f32 = 2392.0 / 128.0;
+const PQ_PEAK_NITS: f32 = 10000.0;
+
+fn pqEncodeScalar(x: f32) -> f32 {
+  let xn = clamp(x / PQ_PEAK_NITS, 0.0, 1.0);
+  let xp = pow(xn, PQ_M1);
+  let num = PQ_C1 + PQ_C2 * xp;
+  let den = 1.0 + PQ_C3 * xp;
+  return pow(num / den, PQ_M2);
+}
+
+fn pqDecodeScalar(x: f32) -> f32 {
+  let xp = pow(clamp(x, 0.0, 1.0), 1.0 / PQ_M2);
+  let num = max(xp - PQ_C1, 0.0);
+  let den = PQ_C2 - PQ_C3 * xp;
+  let ratio = num / max(den, 1e-6);
+  return pow(max(ratio, 0.0), 1.0 / PQ_M1) * PQ_PEAK_NITS;
+}
+
+fn linearSRGBToICtCp(col: vec3<f32>) -> vec3<f32> {
+  let clamped = clamp(col, vec3<f32>(0.0), vec3<f32>(U.overbright));
+  let rgb2020 = linearSRGBToLinearRec2020(clamped);
+  let lmsLinear = vec3<f32>(
+    0.412109375 * rgb2020.x + 0.523925781 * rgb2020.y + 0.063964844 * rgb2020.z,
+    0.166748047 * rgb2020.x + 0.720458984 * rgb2020.y + 0.112792969 * rgb2020.z,
+    0.024169922 * rgb2020.x + 0.075439453 * rgb2020.y + 0.900390625 * rgb2020.z
+  );
+  let lmsNits = max(lmsLinear * HDR_WHITE_NITS, vec3<f32>(0.0));
+  let lp = pqEncodeScalar(lmsNits.x);
+  let mp = pqEncodeScalar(lmsNits.y);
+  let sp = pqEncodeScalar(lmsNits.z);
+  let i = 0.5 * lp + 0.5 * mp;
+  let ct = 1.6137 * lp - 3.3234 * mp + 1.7097 * sp;
+  let cp = 4.3781 * lp - 4.2455 * mp - 0.1326 * sp;
+  return vec3<f32>(i, ct, cp);
+}
+
+fn ictcpToLinearSRGB(ictcp: vec3<f32>) -> vec3<f32> {
+  let lp = ictcp.x + 0.008609037 * ictcp.y + 0.111029625 * ictcp.z;
+  let mp = ictcp.x - 0.008609037 * ictcp.y - 0.111029625 * ictcp.z;
+  let sp = ictcp.x + 0.560031335 * ictcp.y - 0.320627174 * ictcp.z;
+  let l = pqDecodeScalar(lp);
+  let m = pqDecodeScalar(mp);
+  let s = pqDecodeScalar(sp);
+  let lmsLinear = vec3<f32>(l, m, s) / HDR_WHITE_NITS;
+  let rgb2020 = vec3<f32>(
+    3.436607 * lmsLinear.x - 2.506452 * lmsLinear.y + 0.069845 * lmsLinear.z,
+    -0.791330 * lmsLinear.x + 1.983600 * lmsLinear.y - 0.192271 * lmsLinear.z,
+    -0.025950 * lmsLinear.x - 0.098914 * lmsLinear.y + 1.124864 * lmsLinear.z
+  );
+  let col = linearRec2020ToLinearSRGB(rgb2020);
+  return clamp(col, vec3<f32>(0.0), vec3<f32>(U.overbright));
+}
+
+fn mixICtCp(a: vec3<f32>, b: vec3<f32>, t: f32) -> vec3<f32> {
+  let ia = linearSRGBToICtCp(a);
+  let ib = linearSRGBToICtCp(b);
+  let mixed = ia + (ib - ia) * t;
+  return ictcpToLinearSRGB(mixed);
+}
+
+fn mixOkLab(a: vec3<f32>, b: vec3<f32>, t: f32) -> vec3<f32> {
+  let la = linearSRGBToOkLab(a);
+  let lb = linearSRGBToOkLab(b);
+  let lab = la + (lb - la) * t;
+  return clamp(oklabToLinearSRGB(lab), vec3<f32>(0.0), vec3<f32>(U.overbright));
+}
+fn mixLab(a: vec3<f32>, b: vec3<f32>, t: f32) -> vec3<f32> {
+  let la = linearSRGBToLab(a);
+  let lb = linearSRGBToLab(b);
+  let lab = la + (lb - la) * t;
+  return labToLinearSRGB(lab);
+}
+
+fn gradientPattern(uv: vec2<f32>) -> vec3<f32> {
+  let v = uv.x * U.overbright;
+  var lin = v;
+  if (U.bits != 0u) { lin = quantizeSRGB(lin, U.bits); } // quantize only in SDR (0..1)
+  var col = vec3<f32>(lin);
+  return col;
+}
+
+fn colorByIndex(i: u32) -> vec3<f32> {
+  if (i == 0u) { return vec3<f32>(1.0, 1.0, 1.0); } // White
+  if (i == 1u) { return vec3<f32>(1.0, 1.0, 0.0); } // Yellow
+  if (i == 2u) { return vec3<f32>(0.0, 1.0, 1.0); } // Cyan
+  if (i == 3u) { return vec3<f32>(0.0, 1.0, 0.0); } // Green
+  if (i == 4u) { return vec3<f32>(1.0, 0.0, 1.0); } // Magenta
+  if (i == 5u) { return vec3<f32>(1.0, 0.0, 0.0); } // Red
+  return vec3<f32>(0.0, 0.0, 1.0);                 // Blue
+}
+
+fn hdrColorBarsPattern(uv: vec2<f32>) -> vec3<f32> {
+  // Two rows: top SDR color bars at 1.0, bottom HDR bars scaled across range
+  let stripes = 7.0;
+  let idxf = clamp(floor(uv.x * stripes), 0.0, stripes - 1.0);
+  let idx: u32 = u32(idxf);
+  let isTop = uv.y > 0.5; // NOTE: uv.y grows upward on screen
+
+  var col = colorByIndex(idx);
+
+  if (isTop) {
+    // Optional quantization within [0,1]
+    if (U.bits != 0u) {
+      col = vec3<f32>(
+        quantizeSRGB(col.r, U.bits),
+        quantizeSRGB(col.g, U.bits),
+        quantizeSRGB(col.b, U.bits)
+      );
+    }
+    return col;
+  }
+
+  // Bottom row: apply increasing HDR highlight factors per stripe
+  var scale: f32 = 1.0;
+  if (idx == 0u) { scale = 0.25; }
+  else if (idx == 1u) { scale = 0.5; }
+  else if (idx == 2u) { scale = 1.0; }
+  else if (idx == 3u) { scale = 2.0; }
+  else if (idx == 4u) { scale = 4.0; }
+  else if (idx == 5u) { scale = 6.0; }
+  else { scale = 8.0; }
+  scale = min(scale, U.overbright);
+  col *= vec3<f32>(scale);
+  return col;
+}
+
+fn hdrStepsPattern(uv: vec2<f32>) -> vec3<f32> {
+  // 6 squares: 0.25, 0.5, 1, 2, 4, 8
+  let cols = 6.0;
+  let idx = clamp(floor(uv.x * cols), 0.0, cols-1.0);
+  var val: f32 = 1.0;
+  if (idx < 1.0) { val = 0.25; }
+  else if (idx < 2.0) { val = 0.5; }
+  else if (idx < 3.0) { val = 1.0; }
+  else if (idx < 4.0) { val = 2.0; }
+  else if (idx < 5.0) { val = 4.0; }
+  else { val = 8.0; }
+  var col = vec3<f32>(val);
+  // Add 10% border grid to help comparison
+  let gx = step(0.98, fract(uv.x * cols));
+  let gy = step(0.98, uv.y) + step(0.98, 1.0 - uv.y);
+  col *= (1.0 - max(gx, gy) * 0.3);
+  if (U.bits != 0u) { // optional quantization only up to 1.0
+    var q = clamp(col, vec3<f32>(0.0), vec3<f32>(1.0));
+    q.x = quantizeSRGB(q.x, U.bits);
+    col = vec3<f32>(q.x);
+  }
+  return col;
+}
+
+fn p3vsSRGBPattern(uv: vec2<f32>) -> vec3<f32> {
+  // Five vertical stripes: R, G, B, Y, M (fully saturated in working gamut)
+  let stripes = 5.0;
+  let idx = clamp(floor(uv.x * stripes), 0.0, stripes-1.0);
+  var col = vec3<f32>(0.0);
+  if (idx < 1.0) { col = vec3<f32>(1.0, 0.0, 0.0); }
+  else if (idx < 2.0) { col = vec3<f32>(0.0, 1.0, 0.0); }
+  else if (idx < 3.0) { col = vec3<f32>(0.0, 0.0, 1.0); }
+  else if (idx < 4.0) { col = vec3<f32>(1.0, 1.0, 0.0); }
+  else { col = vec3<f32>(1.0, 0.0, 1.0); }
+  // Dimming bars to highlight saturation
+  let gy = abs(fract(uv.y * 8.0) - 0.5);
+  let dim = smoothstep(0.0, 0.5, gy);
+  col *= mix(0.5, 1.0, dim);
+  return col;
+}
+
+fn colorInterpolationPattern(uv: vec2<f32>) -> vec3<f32> {
+  let rows = 3.0;
+  let cols = 3.0;
+  // Make row 0 be the TOP row so labels match: 0=ICtCp, 1=OkLab, 2=CIELAB
+  let rowIdx = clamp(floor((1.0 - uv.y) * rows), 0.0, rows - 1.0);
+  let colIdx = clamp(floor(uv.x * cols), 0.0, cols - 1.0);
+  let cellUV = vec2<f32>(fract(uv.x * cols), fract((1.0 - uv.y) * rows));
+
+  var c0 = vec3<f32>(0.25, 0.0, 0.0);
+  var c1 = vec3<f32>(0.0, 2.5, 0.0);
+  if (colIdx >= 1.0 && colIdx < 2.0) {
+    c0 = vec3<f32>(0.0, 0.0, 0.35);
+    c1 = vec3<f32>(2.2, 2.0, 0.0);
+  } else if (colIdx >= 2.0) {
+    c0 = vec3<f32>(0.6, 0.2, 0.0);
+    c1 = vec3<f32>(0.1, 0.5, 2.8);
+  }
+
+  let swatch = 0.08;
+  var col = vec3<f32>(0.0);
+  if (cellUV.x < swatch) {
+    col = c0;
+  } else if (cellUV.x > 1.0 - swatch) {
+    col = c1;
+  } else {
+    let t = clamp((cellUV.x - swatch) / (1.0 - 2.0 * swatch), 0.0, 1.0);
+    if (rowIdx < 0.5) {
+      col = mixICtCp(c0, c1, t);          // ICtCp (top row, HDR clamp)
+    } else if (rowIdx < 1.5) {
+      col = mixOkLab(c0, c1, t);          // OkLab (middle)
+    } else {
+      col = mixLab(c0, c1, t);            // CIELAB (bottom)
+    }
+
+    let tick = fract(t * 5.0);
+    if (tick < 0.01 || tick > 0.99) {
+      col = mix(col, vec3<f32>(0.92), 0.25);
+    }
+  }
+
+  let rowFrac = fract((1.0 - uv.y) * rows);
+  let colFrac = fract(uv.x * cols);
+  var borderMask: f32 = 0.0;
+  if (rowFrac < 0.002 || rowFrac > 0.998) { borderMask = 1.0; }
+  if (colFrac < 0.002 || colFrac > 0.998) { borderMask = 1.0; }
+  if (borderMask > 0.0) { col = mix(col, vec3<f32>(0.05), 0.8); }
+
+  if (U.bits != 0u) {
+    col = vec3<f32>(
+      quantizeSRGB(col.r, U.bits),
+      quantizeSRGB(col.g, U.bits),
+      quantizeSRGB(col.b, U.bits)
+    );
+  }
+  return col;
+}
+
+@fragment fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+  // Clip-space Y grows up; screen Y grows down. Keep uv as-is but treat uv.y>0.5 as TOP.
+  let uv = clamp(in.uv, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
+  var col: vec3<f32>;
+  switch (U.pattern) {
+    case 0u: { col = gradientPattern(uv); }
+    case 1u: { col = hdrColorBarsPattern(uv); }
+    case 2u: { col = hdrStepsPattern(uv); }
+    case 3u: { col = p3vsSRGBPattern(uv); }
+    default: { col = colorInterpolationPattern(uv); }
+  }
+  return vec4<f32>(col, 1.0);
+}
+`;
+
+      async function initWebGPU() {
+        if (!('gpu' in navigator)) {
+          webgpuFailed = true; webgpuReady = false; updateStatusChips();
+          throw new Error('WebGPU not supported');
+        }
+        let adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) throw new Error('No GPU adapter');
+        device = await adapter.requestDevice();
+        context = canvas.getContext('webgpu');
+
+        // Choose initial format & color space
+        const preferred = navigator.gpu.getPreferredCanvasFormat();
+        format = preferred;
+        colorSpace = colorspaceSel.value;
+
+        await configureSwapchain({ preferExtended: 'on' });
+
+        // Uniform buffer
+        uniformBuf = device.createBuffer({ size: paramsLayout.size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+        // Pipeline
+        await rebuildPipeline();
+
+        // Event-driven rendering
+        window.addEventListener('resize', onResize);
+        document.addEventListener('fullscreenchange', onResize);
+        watchDPR();
+        observeContainer();
+        bindUI();
+        onResize();
+        renderOnce();
+
+        webgpuReady = true;
+        updateStatusChips();
+      }
+
+      async function rebuildPipeline() {
+        const module = makeShaderModule(shaderWGSL);
+        const bindGroupLayout = device.createBindGroupLayout({
+          entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }],
+        });
+        const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+        pipeline = device.createRenderPipeline({
+          layout: pipelineLayout,
+          vertex: { module, entryPoint: 'vs_main' },
+          fragment: { module, entryPoint: 'fs_main', targets: [{ format }] },
+          primitive: { topology: 'triangle-list' },
+        });
+        const bindGroup = device.createBindGroup({ layout: bindGroupLayout, entries: [{ binding: 0, resource: { buffer: uniformBuf } }] });
+        pipeline._bindGroup = bindGroup;
+      }
+
+      async function configureSwapchain({ preferExtended = 'on' } = {}) {
+        resizeCanvas();
+        const preferred = navigator.gpu.getPreferredCanvasFormat();
+        let desiredFormat = preferred;
+        let desiredColorSpace = colorspaceSel.value;
+        let extTried = false;
+        let extOk = false;
+
+        if (preferExtended !== 'off') {
+          // Try rgba16float for extended range HDR/scRGB
+          extTried = true;
+          try {
+            context.configure({ device, format: 'rgba16float', usage: GPUTextureUsage.RENDER_ATTACHMENT, alphaMode: 'opaque', colorSpace: desiredColorSpace });
+            desiredFormat = 'rgba16float';
+            extOk = true;
+          } catch (e) { extOk = false; }
+        }
+
+        if (!extOk) {
+          // Fall back to preferred
+          context.configure({ device, format: preferred, usage: GPUTextureUsage.RENDER_ATTACHMENT, alphaMode: 'opaque', colorSpace: desiredColorSpace });
+          desiredFormat = preferred;
+        }
+
+        format = desiredFormat;
+        usingExtended = (desiredFormat === 'rgba16float');
+        colorSpace = desiredColorSpace;
+
+        extAttempted = extTried;
+        webgpuReady = true;
+        updateStatusChips();
+      }
+
+      function onResize() { resizeCanvas(); renderOnce(); updateStatusChips(); }
+
+      function writeUniforms() {
+        const buf = new ArrayBuffer(paramsLayout.size);
+        const u32 = new Uint32Array(buf);
+        const f32 = new Float32Array(buf);
+        u32[0] = state.pattern >>> 0;
+        u32[1] = state.bits >>> 0;
+        f32[2] = state.overbright;
+        f32[3] = presentationSize[0];
+        f32[4] = presentationSize[1];
+        device.queue.writeBuffer(uniformBuf, 0, buf);
+      }
+
+      function renderOnce() {
+        updateLabels();
+        if (!device || !pipeline) return;
+        writeUniforms();
+        const encoder = device.createCommandEncoder();
+        const view = context.getCurrentTexture().createView();
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{ view, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }]
+        });
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, pipeline._bindGroup);
+        pass.draw(3, 1, 0, 0);
+        pass.end();
+        device.queue.submit([encoder.finish()]);
+      }
+
+      // UI actions
+      fullscreenBtn.addEventListener('click', async () => {
+        try {
+          if (!document.fullscreenElement) {
+            await document.documentElement.requestFullscreen({ navigationUI: 'hide' });
+          } else {
+            await document.exitFullscreen();
+          }
+        } catch (e) { console.warn('Fullscreen rejected', e); }
+      });
+      window.addEventListener('keydown', (e) => { if (e.key === 'f') fullscreenBtn.click(); });
+
+      function bindUI() {
+        const applyState = () => {
+          state.pattern = Number(patternSel.value);
+          state.overbright = Number(overbrightSlider.value);
+          updateLabels();
+          renderOnce();
+        };
+        patternSel.addEventListener('change', applyState);
+        overbrightSlider.addEventListener('input', applyState);
+
+        const reconfigure = async () => {
+          try { await configureSwapchain({ preferExtended: 'on' }); await rebuildPipeline(); renderOnce(); }
+          catch (e) { console.warn('Auto reconfigure failed', e); }
+        };
+        colorspaceSel.addEventListener('change', reconfigure);
+        applyState(); // Initialize
+      }
+
+      // Initialize
+      (async () => { try { await initWebGPU(); } catch (err) { console.error(err); webgpuFailed = true; webgpuReady = false; updateStatusChips(); } })();
+    </script>
+  </body>
+</html>
